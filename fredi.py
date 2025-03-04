@@ -26,6 +26,8 @@
     Modified endpoint check to use full request (path + query string) if a query string is specified in an allowed endpoint.
 0.7
     Custom HTML error page when endpoint is not allowed.
+0.8:
+    Added --header parameter to optionally require a specific header for forwarding traffic.
 '''
 import argparse
 from flask import Flask, request, Response
@@ -36,15 +38,26 @@ import urllib3
 app = Flask(__name__)
 TARGET_SERVER = ""
 ALLOWED_ENDPOINTS = None  # List of endpoints to forward; if None, all routes are forwarded
-
-# Let's add all just to be safe
+REQUIRED_HEADER = None    # Tuple of (header_name, expected_value or None)
 
 @app.route('/', defaults={'path': ''}, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 @app.route('/<path:path>', methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 def proxy(path):
     # Always decode query string so it's available for later
     qs = request.query_string.decode("utf-8")
-    
+
+    # Check for required header if provided.
+    if REQUIRED_HEADER is not None:
+        header_name, expected_value = REQUIRED_HEADER
+        actual_value = request.headers.get(header_name)
+        if not actual_value or (expected_value is not None and actual_value != expected_value):
+            try:
+                with open("custom404.html", "r") as f:
+                    html = f.read()
+            except Exception as e:
+                html = "<html><head><title>404 Not Found</title></head><body><h1>Oops Page does not Exist</h1></body></html>"
+            return Response(html, status=404, mimetype="text/html")
+
     # If ALLOWED_ENDPOINTS is set, only forward if the request path is allowed.
     if ALLOWED_ENDPOINTS is not None:
         allowed = False
@@ -52,28 +65,23 @@ def proxy(path):
         full_req = request.path if not qs else f"{request.path}?{qs}"
         for endpoint in ALLOWED_ENDPOINTS:
             endpoint = endpoint.strip()
-            # I use the "?" as a placeholder because it is really common to see this one but we can add more like @, #, $, % if needed
             if "?" in endpoint:
-                # For endpoints containing a query string, require an exact match.
                 if full_req == endpoint:
                     allowed = True
                     break
             else:
-                # Otherwise, allow if the request path starts with the allowed endpoint.
                 if request.path.startswith(endpoint):
                     allowed = True
                     break
         if not allowed:
             try:
-                # Attempt to read the custom HTML error page.
                 with open("custom404.html", "r") as f:
                     html = f.read()
             except Exception as e:
-                # Fallback HTML if the file is not found.
-                html = "<html><head><title>404 Not Found</title></head><body><h1>Endpoint not allowed</h1></body></html>"
+                html = "<html><head><title>404 Not Found</title></head><body><h1>Oops Page does not Exist</h1></body></html>"
             return Response(html, status=404, mimetype="text/html")
     
-    # Construct the URL to forward the request to
+    # Construct the URL to forward the request to.
     if qs:
         url = f"{TARGET_SERVER.rstrip('/')}/{path}?{qs}"
     else:
@@ -82,7 +90,6 @@ def proxy(path):
     headers = {key: value for key, value in request.headers if key.lower() != 'host'}
 
     try:
-        # Forward the request to the target server.
         resp = requests.request(
             method=request.method,
             url=url,
@@ -91,7 +98,6 @@ def proxy(path):
             cookies=request.cookies,
             allow_redirects=False,
             stream=True,
-            # Verify should be false to accept all traffic
             verify=False
         )
     except requests.exceptions.RequestException as e:
@@ -112,6 +118,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=443,
                         help="Local port to listen on (default: 443)")
     parser.add_argument("--endpoints", help='Comma-separated list of endpoints to forward (e.g. "/admin.php,/submit.php?id=882686070")')
+    parser.add_argument("--header", help="Optional required header for forwarding requests. Format: 'HeaderName:Value'. If only header name is provided, only its presence is checked.")
     args = parser.parse_args()
 
     # Check if the target includes a scheme; if not, assume 'https://'
@@ -119,7 +126,6 @@ if __name__ == "__main__":
         args.target = "https://" + args.target
 
     # If no port is provided in the target, append the custom port.
-    # This is a simple check: if the part after '://' does not contain a colon, append the port.
     target_no_scheme = args.target.split("://")[1]
     if ":" not in target_no_scheme:
         args.target = args.target + f":{args.port}"
@@ -130,11 +136,23 @@ if __name__ == "__main__":
     if args.endpoints:
         ALLOWED_ENDPOINTS = [e if e.startswith("/") else "/" + e for e in args.endpoints.split(",")]
 
+    # Parse required header if provided.
+    if args.header:
+        if ":" in args.header:
+            header_name, header_value = args.header.split(":", 1)
+            REQUIRED_HEADER = (header_name.strip(), header_value.strip())
+        else:
+            REQUIRED_HEADER = (args.header.strip(), None)
+    
     print(f"Redirecting all requests to: {TARGET_SERVER}")
     if ALLOWED_ENDPOINTS:
         print(f"Only forwarding requests to the following endpoints: {ALLOWED_ENDPOINTS}")
+    if REQUIRED_HEADER:
+        if REQUIRED_HEADER[1]:
+            print(f"Requests must include header '{REQUIRED_HEADER[0]}: {REQUIRED_HEADER[1]}'")
+        else:
+            print(f"Requests must include header '{REQUIRED_HEADER[0]}'")
     # Disable warnings, I know the risks
     # https://urllib3.readthedocs.io/en/latest/advanced-usage.html#tls-warnings
     urllib3.disable_warnings()
     app.run(host="0.0.0.0", port=args.port, ssl_context='adhoc')
-
